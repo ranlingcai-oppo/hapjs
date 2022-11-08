@@ -16,15 +16,18 @@ import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
 import android.widget.BaseAdapter;
 import android.widget.CompoundButton;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.ListPopupWindow;
 import android.widget.PopupWindow;
@@ -41,6 +44,8 @@ import androidx.fragment.app.DialogFragment;
 import androidx.fragment.app.Fragment;
 
 import org.hapjs.debug.log.DebuggerLogUtil;
+import org.hapjs.debugger.AppLaunchTestActivity;
+import org.hapjs.debugger.SignatureActivity;
 import org.hapjs.debugger.app.impl.R;
 import org.hapjs.debugger.debug.AppDebugManager;
 import org.hapjs.debugger.pm.PackageInfo;
@@ -89,7 +94,6 @@ public abstract class DebugFragment extends Fragment implements AdapterView.OnIt
     @Override
     public View onCreateView(LayoutInflater inflater, @Nullable ViewGroup container, @Nullable Bundle savedInstanceState) {
         View view = setupViews(inflater, container);
-        setupDebug();
         setupServer();
         return view;
     }
@@ -119,9 +123,6 @@ public abstract class DebugFragment extends Fragment implements AdapterView.OnIt
             }
         };
 
-        mDebugHintView = view.findViewById(R.id.debug_hint);
-        mDebugHintView.setOnClickListener(v -> showDebugHint(mDebugHintView));
-
         mScanInstallBtn = view.findViewById(R.id.btn_scan_install);
         mLocalInstallBtn = view.findViewById(R.id.btn_local_install);
         mUpdateOnlineBtn = view.findViewById(R.id.btn_update_online);
@@ -149,8 +150,28 @@ public abstract class DebugFragment extends Fragment implements AdapterView.OnIt
         });
         mUsbDebugSwitch.setChecked(PreferenceUtils.isUseADB(getActivity()));
         setSwitchStateText(view, R.id.usb_state_text, PreferenceUtils.isUseADB(getActivity()));
-
+        view.findViewById(R.id.launch_app_test_layout).setOnClickListener(v -> startLaunchTestActivity());
+        view.findViewById(R.id.get_sign_layout).setOnClickListener(v -> startSignatureActivity());
         return view;
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+
+        setupDebug();
+
+        if (!PreferenceUtils.hasShownDebugHint(getActivity())) {
+            Handler handler = new Handler();
+            handler.post(() -> {
+                PopupWindow popupWindow = showDebugHint(mDebugHintView);
+                handler.postDelayed(() -> {
+                    if (popupWindow.isShowing()) {
+                        popupWindow.dismiss();
+                    }
+                }, 6000);
+            });
+        }
     }
 
     protected void setSwitchStateText(View ancestor, int id, boolean enable) {
@@ -160,23 +181,19 @@ public abstract class DebugFragment extends Fragment implements AdapterView.OnIt
     private void setInstallRpkActionsLayout(boolean isUsbEnable) {
         if (!isUsbEnable) {
             mScanInstallBtn.setVisibility(View.VISIBLE);
-            RelativeLayout.LayoutParams localInstallParams = (RelativeLayout.LayoutParams) mLocalInstallBtn.getLayoutParams();
-            localInstallParams.addRule(RelativeLayout.CENTER_IN_PARENT);
-            localInstallParams.removeRule(RelativeLayout.ALIGN_PARENT_START);
+            FrameLayout.LayoutParams localInstallParams = (FrameLayout.LayoutParams) mLocalInstallBtn.getLayoutParams();
+            localInstallParams.gravity = Gravity.CENTER;
             mLocalInstallBtn.setLayoutParams(localInstallParams);
-            RelativeLayout.LayoutParams updateOnlineParams = (RelativeLayout.LayoutParams) mUpdateOnlineBtn.getLayoutParams();
-            updateOnlineParams.addRule(RelativeLayout.ALIGN_PARENT_END);
-            updateOnlineParams.removeRule(RelativeLayout.CENTER_IN_PARENT);
+            FrameLayout.LayoutParams updateOnlineParams = (FrameLayout.LayoutParams) mUpdateOnlineBtn.getLayoutParams();
+            updateOnlineParams.gravity = Gravity.END;
             mUpdateOnlineBtn.setLayoutParams(updateOnlineParams);
         } else {
             mScanInstallBtn.setVisibility(View.GONE);
-            RelativeLayout.LayoutParams localInstallParams = (RelativeLayout.LayoutParams) mLocalInstallBtn.getLayoutParams();
-            localInstallParams.removeRule(RelativeLayout.CENTER_IN_PARENT);
-            localInstallParams.addRule(RelativeLayout.ALIGN_PARENT_START);
+            FrameLayout.LayoutParams localInstallParams = (FrameLayout.LayoutParams) mLocalInstallBtn.getLayoutParams();
+            localInstallParams.gravity = Gravity.START;
             mLocalInstallBtn.setLayoutParams(localInstallParams);
-            RelativeLayout.LayoutParams updateOnlineParams = (RelativeLayout.LayoutParams) mUpdateOnlineBtn.getLayoutParams();
-            updateOnlineParams.removeRule(RelativeLayout.ALIGN_PARENT_END);
-            updateOnlineParams.addRule(RelativeLayout.CENTER_IN_PARENT);
+            FrameLayout.LayoutParams updateOnlineParams = (FrameLayout.LayoutParams) mUpdateOnlineBtn.getLayoutParams();
+            updateOnlineParams.gravity = Gravity.CENTER;
             mUpdateOnlineBtn.setLayoutParams(updateOnlineParams);
         }
     }
@@ -279,14 +296,14 @@ public abstract class DebugFragment extends Fragment implements AdapterView.OnIt
         }
     }
 
-    protected void showDebugHint(View debugHintView) {
+    protected PopupWindow showDebugHint(View debugHintView) {
         String hintText = getDebugHintText();
         if (TextUtils.isEmpty(hintText)) {
-            return;
+            return null;
         }
 
         PopupWindow popupWindow = new PopupWindow(getActivity());
-        popupWindow.setBackgroundDrawable(null);
+        popupWindow.setBackgroundDrawable(new ColorDrawable());
         View content = LayoutInflater.from(getActivity()).inflate(R.layout.debug_hint_popup_content, null);
         ((TextView) content.findViewById(R.id.hint_text)).setText(hintText);
         int[] anchorLoc = new int[2];
@@ -300,7 +317,12 @@ public abstract class DebugFragment extends Fragment implements AdapterView.OnIt
         popupWindow.setOutsideTouchable(true);
         popupWindow.setFocusable(true);
         popupWindow.setContentView(content);
+        popupWindow.setHeight(ViewGroup.LayoutParams.WRAP_CONTENT);
+        popupWindow.setWidth(ViewGroup.LayoutParams.WRAP_CONTENT);
         popupWindow.showAsDropDown(debugHintView);
+
+        PreferenceUtils.setHasShownDebugHint(getActivity());
+        return popupWindow;
     }
 
     protected abstract String getDebugHintText();
@@ -399,6 +421,14 @@ public abstract class DebugFragment extends Fragment implements AdapterView.OnIt
 
     protected void setupDebuggerLogUtil() {
         DebuggerLogUtil.init(getContext().getApplicationContext(), "");
+    }
+
+    protected void startLaunchTestActivity() {
+        startActivity(new Intent(getActivity(), AppLaunchTestActivity.class));
+    }
+
+    protected void startSignatureActivity() {
+        startActivity(new Intent(getActivity(), SignatureActivity.class));
     }
 
     protected void startScanner() {

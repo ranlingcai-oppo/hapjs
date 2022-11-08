@@ -10,7 +10,6 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
-import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.drawable.BitmapDrawable;
@@ -70,11 +69,11 @@ public class SignatureActivity extends DraggableActivity {
                 .commit();
     }
 
-    private static void displaySign(FragmentActivity activity, String name, byte[] sign,
+    private static void displaySign(FragmentActivity activity, int type, String name, byte[] sign,
                                     Drawable icon, String smsHash) {
         new Handler(Looper.getMainLooper()).post(() ->
                 activity.getSupportFragmentManager().beginTransaction()
-                        .replace(R.id.content, new DisplaySignFragment(name, sign, icon, smsHash))
+                        .replace(R.id.content, new DisplaySignFragment(type, name, sign, icon, smsHash))
                         .addToBackStack(DisplaySignFragment.TAG)
                         .commit());
     }
@@ -82,6 +81,7 @@ public class SignatureActivity extends DraggableActivity {
     public static class DisplaySignFragment extends Fragment implements View.OnClickListener {
         private static final String TAG = "DisplaySignFragment";
 
+        private int mType;
         private String mName;
         private byte[] mSign;
         private Drawable mIcon;
@@ -90,7 +90,8 @@ public class SignatureActivity extends DraggableActivity {
         private String mSignMd5;
         private String mSignStr;
 
-        public DisplaySignFragment(String name, byte[] sign, Drawable icon, String smsHash) {
+        public DisplaySignFragment(int type, String name, byte[] sign, Drawable icon, String smsHash) {
+            mType = type;
             mName = name;
             mSign = sign;
             mIcon = icon;
@@ -112,6 +113,10 @@ public class SignatureActivity extends DraggableActivity {
             content.findViewById(R.id.back).setOnClickListener(this);
             ((TextView) content.findViewById(R.id.app_label)).setText(mName);
 
+            int titleResId = mType == TYPE_APK ? R.string.title_get_native_app_sign :
+                    (mType == TYPE_RPK ? R.string.title_get_rpk_sign : R.string.title_get_pem_sign);
+
+            ((TextView) content.findViewById(R.id.display_sign_title)).setText(getResources().getString(titleResId));
             ((TextView) content.findViewById(R.id.sign_md5)).setText(mSignMd5);
             ((TextView) content.findViewById(R.id.sign_sha256)).setText(mSignSha256);
             ((TextView) content.findViewById(R.id.sign)).setText(mSignStr);
@@ -348,8 +353,10 @@ public class SignatureActivity extends DraggableActivity {
             if (path.endsWith(".pem") || path.endsWith(".PEM")) {
                 String name = path.substring(path.lastIndexOf("/") + 1);
                 byte[] signature = SignatureUtils.getSignatureFromPem(this, uri);
-                displaySign(this, name, signature, null, null);
-                return;
+                if (signature != null) {
+                    displaySign(this, TYPE_PEM, name, signature, null, null);
+                    return;
+                }
             }
         }
         Toast.makeText(this, R.string.toast_invalid_pem, Toast.LENGTH_SHORT).show();
@@ -358,7 +365,9 @@ public class SignatureActivity extends DraggableActivity {
     private void getSignatureFromRpk(Uri uri) {
         Pair<org.hapjs.debugger.pm.PackageInfo, File> pi = SignatureUtils.getHybridPackageInfo(this, uri);
         if (pi != null && pi.first != null) {
-            displaySign(this, pi.first.getName(), pi.first.getSignature(), getIconDrawable(pi.second), null);
+            String smsHash = SignatureUtils.getSMSHash(pi.first.getPackage(), pi.first.getSignature());
+            displaySign(this, TYPE_RPK, pi.first.getName(), pi.first.getSignature(),
+                    getIconDrawable(pi.second), smsHash);
         } else {
             Toast.makeText(this, R.string.toast_pkg_not_found, Toast.LENGTH_SHORT).show();
         }
@@ -377,26 +386,14 @@ public class SignatureActivity extends DraggableActivity {
         return new BitmapDrawable(bitmap);
     }
 
-    private static Drawable getIconDrawable(FragmentActivity activity, PackageInfo info) {
-        if (info.applicationInfo.icon != 0) {
-            try {
-                return activity.getPackageManager().getResourcesForApplication(info.applicationInfo)
-                        .getDrawable(info.applicationInfo.icon);
-            } catch (PackageManager.NameNotFoundException e) {
-                Log.e(TAG, "failed to get icon from packageInfo: " + info, e);
-            }
-        }
-        return null;
-    }
-
     private static void getSignature(FragmentActivity activity, PackageInfo info) {
         if (info != null) {
             byte[] signature = info.signatures[0].toByteArray();
             CharSequence label = activity.getPackageManager().getApplicationLabel(info.applicationInfo);
-            Drawable icon = getIconDrawable(activity, info);
+            Drawable icon = info.applicationInfo.loadIcon(activity.getPackageManager());
             String appName = TextUtils.isEmpty(label) ? info.packageName : label.toString();
             String smsHash = SignatureUtils.getSMSHash(info.packageName, signature);
-            displaySign(activity, appName, signature, icon, smsHash);
+            displaySign(activity, TYPE_APK, appName, signature, icon, smsHash);
         } else {
             Toast.makeText(activity, R.string.toast_pkg_not_found, Toast.LENGTH_SHORT).show();
         }
