@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2022, the hapjs-platform Project Contributors
+ * Copyright (c) 2021-present, the hapjs-platform Project Contributors
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -52,19 +52,21 @@ import org.hapjs.bridge.ApplicationContext;
 import org.hapjs.bridge.HybridRequest;
 import org.hapjs.bridge.HybridView;
 import org.hapjs.bridge.impl.android.AndroidViewClient;
+import org.hapjs.bridge.storage.file.InternalUriUtils;
 import org.hapjs.card.api.IRenderListener;
 import org.hapjs.common.executors.AbsTask;
 import org.hapjs.common.executors.Executor;
 import org.hapjs.common.executors.Executors;
-import org.hapjs.common.json.JSONObject;
 import org.hapjs.common.net.HttpConfig;
 import org.hapjs.common.net.UserAgentHelper;
 import org.hapjs.common.resident.ResidentManager;
 import org.hapjs.common.utils.BrightnessUtils;
 import org.hapjs.common.utils.DisplayUtil;
+import org.hapjs.common.utils.FoldingUtils;
 import org.hapjs.common.utils.MediaUtils;
 import org.hapjs.common.utils.RouterUtils;
 import org.hapjs.common.utils.ThreadUtils;
+import org.hapjs.common.utils.UriUtils;
 import org.hapjs.component.Component;
 import org.hapjs.component.Container;
 import org.hapjs.component.ResizeEventDispatcher;
@@ -110,6 +112,7 @@ import org.hapjs.runtime.R;
 import org.hapjs.runtime.inspect.InspectorManager;
 import org.hapjs.system.SysOpProvider;
 import org.json.JSONException;
+import org.json.JSONObject;
 
 /**
  * It's a view like WebView, used to render a native app
@@ -176,7 +179,10 @@ public class RootView extends FrameLayout
     private ConfigurationManager.ConfigurationListener mConfigurationListener;
     private AutoplayManager mAutoplayManager;
     private OnDetachedListener mOnDetachedListener;
+    private TabBar mTabBar = null;
     private CountDownLatch mEventCountDownLatch;
+    private ConfigurationChangedTask mTask;
+
     protected RenderEventCallback mRenderEventCallback =
             new RenderEventCallback() {
                 @Override
@@ -471,6 +477,7 @@ public class RootView extends FrameLayout
             if (!routerPage(request)) {
                 onRenderFailed(IRenderListener.ErrorCode.ERROR_PAGE_NOT_FOUND, "Page not found");
             }
+            initTabBar();
         }
     }
 
@@ -520,18 +527,27 @@ public class RootView extends FrameLayout
     protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
         super.onLayout(changed, left, top, right, bottom);
         if (mDocument != null) {
-            if (!changed && mInitialized) {
-                return;
+            if (changed || !mInitialized) {
+                mInitialized = true;
+                DecorLayout mDecorLayout = (DecorLayout) mDocument.getComponent().getInnerView();
+                if (mDecorLayout != null) {
+                    int windowWidth = mDecorLayout.getMeasuredWidth();
+                    int windowHeight = mDecorLayout.getMeasuredHeight() - mDecorLayout.getContentInsets().top;
+
+                    if (windowWidth != DisplayUtil.getViewPortWidthByDp() || windowHeight != DisplayUtil.getViewPortHeightByDp()) {
+                        DisplayUtil.setViewPortWidth(windowWidth);
+                        DisplayUtil.setViewPortHeight(windowHeight);
+                        Page currentPage = this.mPageManager.getCurrPage();
+                        mJsThread.getRenderActionManager().updateMediaPropertyInfo(currentPage);
+                    }
+                }
             }
-            mInitialized = true;
-            DecorLayout mDecorLayout = (DecorLayout) mDocument.getComponent().getInnerView();
-            if (mDecorLayout != null) {
-                int windowWidth = mDecorLayout.getMeasuredWidth();
-                int windowHeight =
-                        mDecorLayout.getMeasuredHeight() - mDecorLayout.getContentInsets().top;
-                DisplayUtil.setViewPortWidth(windowWidth);
-                DisplayUtil.setViewPortHeight(windowHeight);
-            }
+        }
+
+        if (mTask != null && !mTask.consumed) {
+            mTask.consumed = true;
+            mHandler.post(mTask);
+            mTask = null;
         }
     }
 
@@ -627,6 +643,10 @@ public class RootView extends FrameLayout
         mDisplayManager.unregisterDisplayListener(mDisplayListener);
         if (mOnDetachedListener != null) {
             mOnDetachedListener.onDetached();
+        }
+        if (null != mTabBar) {
+            mTabBar.clearTabBar();
+            mTabBar = null;
         }
     }
 
@@ -874,6 +894,10 @@ public class RootView extends FrameLayout
                                         }
                                     });
                         }
+                        if (displayInfo != null) {
+                            String fitMode = displayInfo.getFitMode();
+                            FoldingUtils.setRpkWideScreenFitMode(fitMode);
+                        }
 
                         EventManager.getInstance()
                                 .invoke(new ApplicationLaunchEvent(mAppInfo.getPackage()));
@@ -943,7 +967,9 @@ public class RootView extends FrameLayout
                         } finally {
                             mHandler.sendEmptyMessage(MSG_CHECK_IS_SHOW);
                         }
-
+                        if (null != mAppInfo) {
+                            initTabBar();
+                        }
                         return LoadResult.SUCCESS;
                     }
 
@@ -1039,12 +1065,44 @@ public class RootView extends FrameLayout
             newConfig.setLocale(newLocale);
         }
 
+        boolean configurationChanged = false;
         // handle theme mode change.
         if (curConfig == null || curConfig.getLastUiMode() != newConfig.getUiMode()) {
-            mJsThread.postNotifyConfigurationChanged(currentPage,
-                    JsThread.CONFIGURATION_TYPE_THEME_MODE);
-            mJsThread.getRenderActionManager().updateMediaPropertyInfo(currentPage);
+            configurationChanged = true;
+            mJsThread.postNotifyConfigurationChanged(currentPage, JsThread.CONFIGURATION_TYPE_THEME_MODE);
             newConfig.setLastUiMode(newConfig.getUiMode());
+        }
+
+        /*
+         * orientation/screen size 变化时，前端会根据 configurationChanged 事件重新获取宽高。
+         * 但是只有在 onLayout 完成之后才能获取正确的 ViewPort 大小
+         * 所以使用 ConfigurationChangedTask 来触发postNotifyConfigurationChanged 事件。
+         */
+        //handle orientation change.
+        int newOrientation = newConfig.getOrientation();
+        if (curConfig == null || curConfig.getLastOrientation() != newOrientation) {
+            mTask = new ConfigurationChangedTask(currentPage);
+            mTask.orientationChanged = true;
+            configurationChanged = true;
+            newConfig.setLastOrientation(newOrientation);
+        }
+
+        //handle screen size change.
+        int newScreenSize = newConfig.getScreenSize();
+        if (curConfig == null || curConfig.getScreenSize() != newScreenSize) {
+            if (mTask == null) {
+                mTask = new ConfigurationChangedTask(currentPage);
+            }
+            mTask.screenSizeChanged = true;
+            configurationChanged = true;
+            if (curConfig != null) {
+                newConfig.setLastScreenSize(curConfig.getScreenSize());
+            }
+        }
+
+        // update media query when 'theme mode' or 'orientation' has changed.
+        if (configurationChanged) {
+            mJsThread.getRenderActionManager().updateMediaPropertyInfo(currentPage);
         }
 
         // update config to current page.
@@ -1233,6 +1291,78 @@ public class RootView extends FrameLayout
         InspectorManager.getInspector().onPagePreChange(oldIndex, newIndex, oldPage, newPage);
     }
     /* end implement JsBridgeCallback */
+
+    private void initTabBar() {
+        ThreadUtils.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (null == mTabBar) {
+                    mTabBar = new TabBar();
+                }
+                mTabBar.initTabBarView(RootView.this);
+            }
+        });
+
+    }
+
+    public void updateTabBarData(JSONObject tabbarData) {
+        if (null != mTabBar) {
+            mTabBar.updateTabBarData(this, tabbarData);
+        } else {
+            Log.w(TAG, "updateTabBarData mTabBar is null.");
+        }
+    }
+
+    public boolean notifyTabBarChange(String routerPath) {
+        boolean isValid = false;
+        if (null != mTabBar) {
+            isValid = mTabBar.notifyTabBarChange(this, routerPath);
+        } else {
+            Log.w(TAG, "notifyTabBarChange mTabBar is null.");
+        }
+        return isValid;
+    }
+
+    public boolean prepareTabBarPath(boolean isTabBarPage, String path) {
+        boolean isValid = isTabBarPage;
+        if (null != mTabBar) {
+            isValid = mTabBar.prepareTabBarPath(isTabBarPage, path);
+        } else {
+            Log.w(TAG, "prepareTabBarPath mTabBar is null.");
+        }
+        return isValid;
+    }
+
+    @Override
+    public void addView(View child, int index, ViewGroup.LayoutParams params) {
+        super.addView(child, index, params);
+        refreshViewOrder();
+    }
+
+    private void refreshViewOrder() {
+        View tabbarView = findViewById(R.id.tabbar_container);
+        if (tabbarView != null) {
+            if (indexOfChild(tabbarView) < getChildCount() - 1) {
+                bringChildToFront(tabbarView);
+            }
+        }
+    }
+
+    public Uri tryParseUri(String src) {
+        if (null == mRenderEventCallback) {
+            return null;
+        }
+        Uri result = null;
+        if (!TextUtils.isEmpty(src)) {
+            result = UriUtils.computeUri(src);
+            if (result == null) {
+                result = mRenderEventCallback.getCache(src);
+            } else if (InternalUriUtils.isInternalUri(result)) {
+                result = mRenderEventCallback.getUnderlyingUri(src);
+            }
+        }
+        return result;
+    }
 
     @Override
     public void onPageChanged(int oldIndex, int newIndex, Page oldPage, Page newPage) {
@@ -1885,6 +2015,28 @@ public class RootView extends FrameLayout
         public void onRuntimeDestroy() {
             if (mAndroidViewClient != null) {
                 mAndroidViewClient.onRuntimeDestroy(RootView.this);
+            }
+        }
+    }
+
+    private class ConfigurationChangedTask implements Runnable {
+        boolean orientationChanged = false;
+        boolean screenSizeChanged = false;
+        volatile boolean consumed = false;
+        Page page;
+
+        ConfigurationChangedTask(Page currentPage) {
+            page = currentPage;
+        }
+
+        @Override
+        public void run() {
+            if (orientationChanged) {
+                mJsThread.postNotifyConfigurationChanged(page, JsThread.CONFIGURATION_TYPE_ORIENTATION);
+            }
+
+            if (screenSizeChanged) {
+                mJsThread.postNotifyConfigurationChanged(page, JsThread.CONFIGURATION_TYPE_SCREEN_SIZE);
             }
         }
     }
